@@ -278,6 +278,10 @@ def _import_csv_dexcom(
     id = _retrieve_id_dexcom(path.split("/")[-1], df, id_template)
 
     df.rename(columns={glucose: GLUCOSE, time: TIME}, inplace=True)
+    if "Event Type" in df.columns:
+       egv_rows = df["Event Type"] == "EGV"
+       if egv_rows.any():
+          df = df.loc[egv_rows].copy()
     df[ID] = id
     return df
 
@@ -434,10 +438,12 @@ def preprocess_data(
    # Create a copy of the DataFrame to avoid SettingWithCopyWarning
    df = df.copy()
    
-   df = df.dropna(subset=[GLUCOSE])
-   df.loc[:, GLUCOSE] = df[GLUCOSE].replace("Low", LOW)
-   df.loc[:, GLUCOSE] = df[GLUCOSE].replace("High", HIGH)
-   df.reset_index(drop=True, inplace=True)
+   df = df.dropna(subset=[TIME, GLUCOSE])
+
+   # Convert glucose column to object dtype first to allow mixed types during
+   # replacement (pandas 3.0+ uses StringDtype by default which rejects numeric values)
+   df[GLUCOSE] = df[GLUCOSE].astype(object).replace("Low", LOW).replace("High", HIGH)
+   df = df.reset_index(drop=True)
 
    df[TIME] = pd.to_datetime(df[TIME])
    df[GLUCOSE] = pd.to_numeric(df[GLUCOSE])
@@ -466,26 +472,26 @@ def _resample_data(df: pd.DataFrame, minutes: int = 5, max_gap: int = 45) -> pd.
     """
     id = df.at[0, ID]
 
-    # Sort the DataFrame by datetime
-    resampled_df = df.sort_values(by=[TIME])
+    # Sort the DataFrame by datetime and drop any duplicate timestamps
+    resampled_df = df.sort_values(by=[TIME]).drop_duplicates(subset=[TIME], keep="first")
     resampled_df = resampled_df.set_index(TIME)
 
     interval = str(minutes) + "min"
     # generate the times that match the frequency
     resampled_df = resampled_df.asfreq(interval)
     # add in the original points that don't match the frequency (just for linear time-based interpolation)
-    resampled_df.reset_index(inplace=True)
+    resampled_df = resampled_df.reset_index()
     resampled_df = (pd.concat([resampled_df, df])).drop_duplicates(subset=[TIME])
-    resampled_df.sort_values(by=[TIME], inplace=True)
+    resampled_df = resampled_df.sort_values(by=[TIME])
 
     # interpolate the missing values
-    resampled_df.set_index(TIME, inplace=True)
+    resampled_df = resampled_df.set_index(TIME)
     resampled_df = _interpolate_data(resampled_df, max_gap)
     
     # now that the values have been interpolated, remove the points that don't match the frequency
     resampled_df = resampled_df.asfreq(interval)
     resampled_df[ID] = id # resampled data points might have empty ID values
-    resampled_df.reset_index(inplace=True)
+    resampled_df = resampled_df.reset_index()
 
     return resampled_df
 
@@ -505,6 +511,8 @@ def _interpolate_data(df: pd.DataFrame, max_gap: int) -> pd.DataFrame:
 
     # based heavily on https://stackoverflow.com/questions/67128364/how-to-limit-pandas-interpolation-when-there-is-more-nan-than-the-limit
 
+    df = df.copy()
+
     s = df[GLUCOSE].notnull()
     s = s.ne(s.shift()).cumsum()
 
@@ -521,9 +529,10 @@ def _chunk_time(df: pd.DataFrame) -> pd.DataFrame:
     :return: the Pandas DataFrame with the added column for time chunking
     :rtype: pandas.DataFrame
     """
+    df = df.copy()
     times = df[TIME] - df[TIME].dt.normalize()
     is_waking = (times >= pd.Timedelta(hours=8)) & (times <= pd.Timedelta(hours=22))
-    df["Time Chunking"] = is_waking.replace({True: "Waking", False: "Sleeping"})
+    df["Time Chunking"] = is_waking.map({True: "Waking", False: "Sleeping"})
     return df
 
 def _chunk_day(df: pd.DataFrame) -> pd.DataFrame:
@@ -534,8 +543,9 @@ def _chunk_day(df: pd.DataFrame) -> pd.DataFrame:
     :return: the Pandas DataFrame with the added column for day chunking
     :rtype: pandas.DataFrame
     """
+    df = df.copy()
     is_weekend = df[TIME].dt.dayofweek > 4
-    df["Day Chunking"] = is_weekend.replace({True: "Weekend", False: "Weekday"})
+    df["Day Chunking"] = is_weekend.map({True: "Weekend", False: "Weekday"})
     return df
 
 def segment_data(path: str, df: pd.DataFrame) -> pd.DataFrame:
